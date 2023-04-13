@@ -4,6 +4,12 @@ services:
   iot-kafka-emulator:
     container_name: iot-kafka-emulator
     build: '.'
+    environment:
+      - KAFKA_BROKER_URL=kafka:9092
+      - KAFKA_TOPIC_NAME=sample_topic
+      - KAFKA_BATCH_SIZE=20000
+      - THREAD_NUMBER=1000
+      - RUST_BACKTRACE=full
   zookeeper:
     image: 'bitnami/zookeeper:3.7'
     environment:

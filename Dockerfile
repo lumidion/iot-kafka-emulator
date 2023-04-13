@@ -19,4 +19,6 @@ FROM debian:buster-slim
 
 COPY --from=build /iot-kafka-emulator/target/release/iot-kafka-emulator .
 
+ENV RUST_LOG=info
+
 CMD ["./iot-kafka-emulator"]

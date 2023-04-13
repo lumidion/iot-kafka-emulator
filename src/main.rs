@@ -1,33 +1,91 @@
 use rskafka::client::partition::PartitionClient;
 use rskafka::{
-    client::{partition::Compression, Client, ClientBuilder},
+    client::{error::Error as KafkaClientError, partition::Compression, Client, ClientBuilder},
     record::Record,
     time,
 };
-use std::error::Error;
-use std::io;
-use std::io::{Cursor, Read};
-use std::sync::{Arc, Mutex};
-use std::{thread, time as std_time};
+use std::ops::Index;
+use std::sync::Arc;
+use std::{
+    fmt, thread, time as std_time,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use futures::future::{BoxFuture, FutureExt};
+use rand::Rng;
+
+use log::{error, info};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use time::OffsetDateTime;
 use tokio;
-use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+#[derive(Debug)]
+struct Configuration {
+    topic_name: String,
+    broker_url: String,
+    batch_size: u16,
+    number_of_threads: u16,
+}
+
+impl Configuration {
+    fn from_env() -> Self {
+        let topic_name = get_str_from_env("KAFKA_TOPIC_NAME");
+        let broker_url = get_str_from_env("KAFKA_BROKER_URL");
+        let batch_size = get_int_from_env("KAFKA_BATCH_SIZE", Some(20000));
+        let number_of_threads = get_int_from_env("THREAD_NUMBER", Some(1000));
+
+        Self {
+            topic_name,
+            broker_url,
+            batch_size,
+            number_of_threads,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum SensorStatus {
+    ON,
+    ERROR,
+    RESTARTING,
+}
+
+impl SensorStatus {
+    fn values() -> Vec<SensorStatus> {
+        vec![
+            SensorStatus::ON,
+            SensorStatus::ERROR,
+            SensorStatus::RESTARTING,
+        ]
+    }
+
+    fn random() -> SensorStatus {
+        let statuses = SensorStatus::values();
+        let mut rng_generator = rand::thread_rng();
+        let random_index = rng_generator.gen_range(0..statuses.len());
+        statuses[random_index]
+    }
+}
+
+impl fmt::Display for SensorStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
 
 struct IotRecord<'a> {
     key: &'a KafkaKey,
-    timestamp: OffsetDateTime,
+    timestamp: u128,
+    status: SensorStatus,
 }
 
 impl<'a> IotRecord<'a> {
     fn for_key(key: &'a KafkaKey) -> Self {
         Self {
             key,
-            timestamp: OffsetDateTime::now_utc(),
+            timestamp: get_current_timestamp_in_ms(),
+            status: SensorStatus::random(),
         }
     }
 
@@ -49,7 +107,8 @@ impl Serialize for IotRecord<'_> {
         S: Serializer,
     {
         let mut state = serializer.serialize_struct("IotRecord", 1)?;
-        state.serialize_field("timestamp", &self.timestamp.unix_timestamp())?;
+        state.serialize_field("timestamp", &self.timestamp.to_string().as_str())?;
+        state.serialize_field("status", &self.status.to_string())?;
         state.end()
     }
 }
@@ -71,6 +130,44 @@ impl KafkaKey {
     }
 }
 
+fn get_current_timestamp_in_ms() -> u128 {
+    let start = SystemTime::now();
+    start.duration_since(UNIX_EPOCH).unwrap().as_millis()
+}
+
+fn get_str_from_env(key: &str) -> String {
+    std::env::var(key).expect(format!("{} should be present in the environment", key).as_str())
+}
+
+fn get_int_from_env(key: &str, upper_limit_option: Option<u16>) -> u16 {
+    let value = get_str_from_env(&key);
+    let number_value = value.parse::<u16>().expect(
+        format!(
+            "{} could not be converted to an integer between 0 and 65,535 for key, {}",
+            value, key
+        )
+        .as_str(),
+    );
+
+    let final_res = match upper_limit_option {
+        Some(upper_limit) => {
+            if number_value <= upper_limit {
+                Ok(number_value)
+            } else {
+                Err(format!(
+                    "Maximum value for key {} is set to {}. Value received: {}",
+                    key,
+                    upper_limit.to_string(),
+                    value,
+                ))
+            }
+        }
+        None => Ok(number_value),
+    };
+
+    final_res.unwrap()
+}
+
 async fn produce_records_for_keys<'a>(client: &'a PartitionClient, keys: &'a Vec<KafkaKey>) {
     let records_res: Result<Vec<Record>, serde_json::Error> = keys
         .into_iter()
@@ -79,76 +176,81 @@ async fn produce_records_for_keys<'a>(client: &'a PartitionClient, keys: &'a Vec
 
     let records = records_res.expect("Keys should be parseable into kafka records");
 
-    client
-        .produce(records, Compression::default())
-        .await
-        .unwrap();
-
-    thread::sleep(std_time::Duration::from_millis(500));
+    client.produce(records, Compression::Gzip).await.unwrap(); //TODO: compression here should probably be specified in config
 }
 
-async fn continuously_produce_records_for_keys(client: &PartitionClient) {
-    let keys = generate_keys();
+async fn continuously_produce_records_for_keys(client: &PartitionClient, batch_size: &u16) {
+    let keys = generate_keys(&batch_size);
     loop {
         produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
-        produce_records_for_keys(&client, &keys).await;
+        thread::sleep(std_time::Duration::from_millis(500));
     }
 }
 
-fn generate_keys() -> Vec<KafkaKey> {
-    vec![
-        KafkaKey::new(),
-        KafkaKey::new(),
-        KafkaKey::new(),
-        KafkaKey::new(),
-        KafkaKey::new(),
-        KafkaKey::new(),
-        KafkaKey::new(),
-        KafkaKey::new(),
-        KafkaKey::new(),
-        KafkaKey::new(),
-    ]
+fn generate_keys(number_of_keys: &u16) -> Vec<KafkaKey> {
+    Vec::from_iter(0..number_of_keys.clone())
+        .into_iter()
+        .map(|_| KafkaKey::new())
+        .collect()
 }
 
 async fn create_topic(client: &Client, topic_name: &str) {
-    println!("Creating topic");
+    info!("Creating topic");
     let controller_client = client.controller_client().unwrap();
-    controller_client
+    let res = controller_client
         .create_topic(topic_name, 2, 1, 5_000)
-        .await
-        .unwrap();
+        .await;
 
-    println!("Topic created");
+    match res {
+        Ok(_) => info!("Topic created"),
+        Err(KafkaClientError::ServerError(err, _)) => {
+            let msg = format!("{}", err);
+            if msg == "TopicAlreadyExists" {
+                info!("Topic already exists. Continuing to message production.")
+            } else {
+                panic!("{}", err)
+            }
+        }
+        Err(err) => panic!("{}", err),
+    }
 }
 
 async fn run() {
-    let connection = "kafka:9092".to_owned();
+    let configuration = Configuration::from_env();
+    info!("Successfully loaded configuration: {:?}", configuration);
+
+    let connection = configuration.broker_url.to_owned();
     let client = ClientBuilder::new(vec![connection]).build().await.unwrap();
 
-    let topic_name = "sample_topic";
+    create_topic(&client, configuration.topic_name.as_str()).await;
 
-    create_topic(&client, &topic_name).await;
+    let partition_client: Arc<PartitionClient> = Arc::new(
+        client
+            .partition_client(configuration.topic_name.to_owned(), 0)
+            .unwrap(),
+    );
 
-    let partition_client: Arc<PartitionClient> =
-        Arc::new(client.partition_client(topic_name.to_owned(), 0).unwrap());
+    for _ in 0..configuration.number_of_threads {
+        let cloned_client = partition_client.clone();
+        let cloned_batch_size = Arc::new(configuration.batch_size);
+        tokio::spawn(async move {
+            continuously_produce_records_for_keys(
+                cloned_client.as_ref(),
+                cloned_batch_size.as_ref(),
+            )
+            .await
+        });
+    }
 
     loop {
-        let cloned_client = partition_client.clone();
-        tokio::spawn(
-            async move { continuously_produce_records_for_keys(cloned_client.as_ref()).await },
-        );
+        thread::sleep(std_time::Duration::from_millis(10));
     }
 }
 
 fn main() {
+    env_logger::init();
+    info!("Initializing application");
+
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     runtime.block_on(run());
