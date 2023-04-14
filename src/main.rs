@@ -4,7 +4,7 @@ use rskafka::{
     record::Record,
     time,
 };
-use std::ops::Index;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::{
     fmt, thread, time as std_time,
@@ -13,7 +13,7 @@ use std::{
 
 use rand::Rng;
 
-use log::{error, info};
+use log::info;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use time::OffsetDateTime;
@@ -25,6 +25,7 @@ struct Configuration {
     topic_name: String,
     broker_url: String,
     batch_size: u16,
+    batch_interval_ms: u64,
     number_of_threads: u16,
 }
 
@@ -32,13 +33,15 @@ impl Configuration {
     fn from_env() -> Self {
         let topic_name = get_str_from_env("KAFKA_TOPIC_NAME");
         let broker_url = get_str_from_env("KAFKA_BROKER_URL");
-        let batch_size = get_int_from_env("KAFKA_BATCH_SIZE", Some(20000));
-        let number_of_threads = get_int_from_env("THREAD_NUMBER", Some(1000));
+        let batch_size = get_u16_from_env("KAFKA_BATCH_SIZE", Some(20000), 1000);
+        let batch_interval_ms = get_u64_from_env("KAFKA_BATCH_INTERVAL", None, 1000);
+        let number_of_threads = get_u16_from_env("THREAD_NUMBER", Some(1000), 500);
 
         Self {
             topic_name,
             broker_url,
             batch_size,
+            batch_interval_ms,
             number_of_threads,
         }
     }
@@ -139,33 +142,57 @@ fn get_str_from_env(key: &str) -> String {
     std::env::var(key).expect(format!("{} should be present in the environment", key).as_str())
 }
 
-fn get_int_from_env(key: &str, upper_limit_option: Option<u16>) -> u16 {
-    let value = get_str_from_env(&key);
-    let number_value = value.parse::<u16>().expect(
-        format!(
-            "{} could not be converted to an integer between 0 and 65,535 for key, {}",
-            value, key
-        )
-        .as_str(),
-    );
+fn get_u16_from_env(key: &str, upper_limit_option: Option<u16>, default: u16) -> u16 {
+    get_num_from_env(key, upper_limit_option, default, u16::MAX)
+}
 
-    let final_res = match upper_limit_option {
-        Some(upper_limit) => {
-            if number_value <= upper_limit {
-                Ok(number_value)
-            } else {
-                Err(format!(
-                    "Maximum value for key {} is set to {}. Value received: {}",
-                    key,
-                    upper_limit.to_string(),
+fn get_u64_from_env(key: &str, upper_limit_option: Option<u64>, default: u64) -> u64 {
+    get_num_from_env(key, upper_limit_option, default, u64::MAX)
+}
+
+fn get_num_from_env<N>(
+    key: &str,
+    upper_limit_option: Option<N>,
+    default: N,
+    system_upper_limit: N,
+) -> N
+where
+    N: FromStr + PartialOrd + ToString,
+    <N as FromStr>::Err: fmt::Debug,
+{
+    let value_res = std::env::var(key);
+
+    match value_res {
+        Ok(value) => {
+            let number_value = value.parse::<N>().expect(
+                format!(
+                    "{} could not be converted to an integer between 0 and {} for key, {}",
                     value,
-                ))
-            }
-        }
-        None => Ok(number_value),
-    };
+                    system_upper_limit.to_string(),
+                    key
+                )
+                .as_str(),
+            );
 
-    final_res.unwrap()
+            let final_res = match upper_limit_option {
+                Some(upper_limit) => {
+                    if number_value <= upper_limit {
+                        Ok(number_value)
+                    } else {
+                        Err(format!(
+                            "Maximum value for key {} is set to {}. Value received: {}",
+                            key,
+                            upper_limit.to_string(),
+                            value,
+                        ))
+                    }
+                }
+                None => Ok(number_value),
+            };
+            final_res.unwrap()
+        }
+        Err(_) => default,
+    }
 }
 
 async fn produce_records_for_keys<'a>(client: &'a PartitionClient, keys: &'a Vec<KafkaKey>) {
@@ -179,11 +206,15 @@ async fn produce_records_for_keys<'a>(client: &'a PartitionClient, keys: &'a Vec
     client.produce(records, Compression::Gzip).await.unwrap(); //TODO: compression here should probably be specified in config
 }
 
-async fn continuously_produce_records_for_keys(client: &PartitionClient, batch_size: &u16) {
+async fn continuously_produce_records_for_keys(
+    client: &PartitionClient,
+    batch_size: &u16,
+    batch_interval_ms: &u64,
+) {
     let keys = generate_keys(&batch_size);
     loop {
         produce_records_for_keys(&client, &keys).await;
-        thread::sleep(std_time::Duration::from_millis(500));
+        thread::sleep(std_time::Duration::from_millis(batch_interval_ms.clone()));
     }
 }
 
@@ -233,10 +264,12 @@ async fn run() {
     for _ in 0..configuration.number_of_threads {
         let cloned_client = partition_client.clone();
         let cloned_batch_size = Arc::new(configuration.batch_size);
+        let cloned_batch_interval_ms = Arc::new(configuration.batch_interval_ms);
         tokio::spawn(async move {
             continuously_produce_records_for_keys(
                 cloned_client.as_ref(),
                 cloned_batch_size.as_ref(),
+                cloned_batch_interval_ms.as_ref(),
             )
             .await
         });
