@@ -7,7 +7,7 @@ use rskafka::{
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{
-    fmt, thread, time as std_time,
+    fmt, fs, thread, time as std_time,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,10 +20,86 @@ use time::OffsetDateTime;
 use tokio;
 use uuid::Uuid;
 
+use async_stream::stream;
+use futures::{pin_mut, StreamExt};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::time::Duration;
+
+type Result<T> = std::result::Result<T, ApplicationError>;
+
+#[derive(Debug, Clone)]
+struct ApplicationError {
+    msg: String,
+}
+
+impl fmt::Display for ApplicationError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Application Error")
+    }
+}
+
+impl ApplicationError {
+    fn new(msg: &str) -> ApplicationError {
+        Self {
+            msg: msg.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DataSource {
+    Generate,
+    Jsonl,
+}
+
+impl DataSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DataSource::Generate => "generate",
+            DataSource::Jsonl => "jsonl",
+        }
+    }
+
+    fn parse_from_config() -> Result<DataSource> {
+        let result_str = match std::env::var("DATA_SOURCE") {
+            Ok(value) => value.to_string(),
+            Err(_) => "generate".to_string(),
+        };
+
+        match result_str.as_str() {
+            "generate" => Ok(DataSource::Generate),
+            "jsonl" => Ok(DataSource::Jsonl),
+            _ => Err(ApplicationError::new(
+                format!(
+                    "Could not parse {} to a valid data source. Valid options: generate, jsonl",
+                    &result_str
+                )
+                .as_str(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JsonLFile {
+    file_path: String,
+    contents: Vec<String>,
+}
+impl JsonLFile {
+    fn new(file_path: &str, contents: Vec<String>) -> Self {
+        Self {
+            file_path: file_path.to_string(),
+            contents: contents.to_vec(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Configuration {
     topic_name: String,
     broker_url: String,
+    data_source: DataSource,
     batch_size: u16,
     batch_interval_ms: u64,
     number_of_threads: u16,
@@ -33,6 +109,8 @@ impl Configuration {
     fn from_env() -> Self {
         let topic_name = get_str_from_env("KAFKA_TOPIC_NAME");
         let broker_url = get_str_from_env("KAFKA_BROKER_URL");
+        let data_source = DataSource::parse_from_config().unwrap();
+
         let batch_size = get_u16_from_env("KAFKA_BATCH_SIZE", Some(20000), 1000);
         let batch_interval_ms = get_u64_from_env("KAFKA_BATCH_INTERVAL", None, 1000);
         let number_of_threads = get_u16_from_env("THREAD_NUMBER", Some(1000), 500);
@@ -40,6 +118,7 @@ impl Configuration {
         Self {
             topic_name,
             broker_url,
+            data_source,
             batch_size,
             batch_interval_ms,
             number_of_threads,
@@ -105,7 +184,7 @@ impl<'a> IotRecord<'a> {
 }
 
 impl Serialize for IotRecord<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -136,6 +215,13 @@ impl KafkaKey {
 fn get_current_timestamp_in_ms() -> u128 {
     let start = SystemTime::now();
     start.duration_since(UNIX_EPOCH).unwrap().as_millis()
+}
+
+fn get_opt_str_from_env(key: &str, default_value: &str) -> String {
+    match std::env::var(key) {
+        Ok(value) => value,
+        Err(_) => default_value.to_string(),
+    }
 }
 
 fn get_str_from_env(key: &str) -> String {
@@ -196,7 +282,7 @@ where
 }
 
 async fn produce_records_for_keys<'a>(client: &'a PartitionClient, keys: &'a Vec<KafkaKey>) {
-    let records_res: Result<Vec<Record>, serde_json::Error> = keys
+    let records_res: std::result::Result<Vec<Record>, serde_json::Error> = keys
         .into_iter()
         .map(|kafka_key| IotRecord::for_key(&kafka_key).to_kafka_record())
         .collect();
@@ -246,6 +332,76 @@ async fn create_topic(client: &Client, topic_name: &str) {
     }
 }
 
+fn get_jsonl_file_paths_from_dir(dir_path: &str) -> Vec<String> {
+    fs::read_dir(dir_path)
+        .expect(format!("Directory not found: {}", dir_path).as_str())
+        .into_iter()
+        .flat_map(|entry_res| match entry_res {
+            Ok(entry) => {
+                let path = entry.path();
+                if path.is_file() {
+                    path.extension().map(|ext| match ext.to_str() {
+                        Some("jsonl") => entry.path().to_str().map(|res| res.to_string()),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<String>>()
+}
+
+fn read_jsonl_from_file(path: &str) -> JsonLFile {
+    let file = File::open(path).expect(format!("Could not open file for path: {}", path).as_str());
+    let reader = BufReader::new(file);
+    let mut contents: Vec<String> = Vec::new();
+
+    for (index, line) in reader.lines().into_iter().enumerate() {
+        let line = line.expect(
+            format!(
+                "Unable to read line {} for file path: {}",
+                index.to_string().as_str(),
+                path
+            )
+            .as_str(),
+        );
+        contents.push(line);
+    }
+
+    JsonLFile::new(path, contents)
+}
+
+async fn send_json_file_to_kafka<'a>(
+    client: &'a PartitionClient,
+    file: &JsonLFile,
+    batch_size: &u16,
+) {
+    let cloned_contents = file.clone().contents;
+    let chunks: Vec<Vec<String>> = vec![cloned_contents];
+
+    let producer_stream = stream! {
+        for json_chunk in chunks {
+            let records = json_chunk
+                .into_iter()
+                .map(|chunk| Record {
+                    key: None,
+                    value: Some(chunk.as_bytes().to_vec()),
+                    headers: Default::default(),
+                    timestamp: OffsetDateTime::now_utc(),
+                })
+                .collect();
+            yield client.produce(records, Compression::Gzip).await.unwrap();
+        }
+    };
+
+    pin_mut!(producer_stream);
+
+    while let Some(value) = producer_stream.next().await {}
+}
+
 async fn run() {
     let configuration = Configuration::from_env();
     info!("Successfully loaded configuration: {:?}", configuration);
@@ -260,23 +416,52 @@ async fn run() {
             .partition_client(configuration.topic_name.to_owned(), 0)
             .unwrap(),
     );
+    match configuration.data_source {
+        DataSource::Generate => {
+            for _ in 0..configuration.number_of_threads {
+                let cloned_client = partition_client.clone();
+                let cloned_batch_size = Arc::new(configuration.batch_size);
+                let cloned_batch_interval_ms = Arc::new(configuration.batch_interval_ms);
+                tokio::spawn(async move {
+                    continuously_produce_records_for_keys(
+                        cloned_client.as_ref(),
+                        cloned_batch_size.as_ref(),
+                        cloned_batch_interval_ms.as_ref(),
+                    )
+                    .await
+                });
+            }
+        }
+        DataSource::Jsonl => {
+            let json_file_paths = get_jsonl_file_paths_from_dir("/app/data/jsonl");
+            let jsonl_loaded_files: Vec<JsonLFile> = json_file_paths
+                .into_iter()
+                .map::<JsonLFile, _>(|path| read_jsonl_from_file(path.as_str()))
+                .collect::<Vec<JsonLFile>>();
 
-    for _ in 0..configuration.number_of_threads {
-        let cloned_client = partition_client.clone();
-        let cloned_batch_size = Arc::new(configuration.batch_size);
-        let cloned_batch_interval_ms = Arc::new(configuration.batch_interval_ms);
-        tokio::spawn(async move {
-            continuously_produce_records_for_keys(
-                cloned_client.as_ref(),
-                cloned_batch_size.as_ref(),
-                cloned_batch_interval_ms.as_ref(),
-            )
-            .await
-        });
+            let file_chunks: Vec<Vec<JsonLFile>> = vec![jsonl_loaded_files];
+
+            for chunk in file_chunks {
+                for file in chunk {
+                    let cloned_client = partition_client.clone();
+                    let cloned_batch_size = Arc::new(configuration.batch_size);
+                    let cloned_file = Arc::new(file);
+                    println!("before spawning");
+                    tokio::spawn(async move {
+                        send_json_file_to_kafka(
+                            cloned_client.as_ref(),
+                            cloned_file.as_ref(),
+                            cloned_batch_size.as_ref(),
+                        )
+                        .await
+                    });
+                }
+            }
+        }
     }
 
     loop {
-        thread::sleep(std_time::Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(1000));
     }
 }
 
