@@ -13,7 +13,8 @@ services:
       - RUST_BACKTRACE=full
       - DATA_SOURCE=jsonl
     volumes:
-      - ~/git/cortex_kafka_connector/performance-test/data/test-data.csv:/app/data/jsonl/test-data.jsonl
+      - ./test-data/test.jsonl:/app/data/jsonl/test.jsonl
+      - ./test-data/test.jsonl:/app/data/jsonl/test/test.jsonl
   zookeeper:
     image: 'bitnami/zookeeper:3.7'
     environment:

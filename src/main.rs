@@ -333,7 +333,8 @@ async fn create_topic(client: &Client, topic_name: &str) {
 }
 
 fn get_jsonl_file_paths_from_dir(dir_path: &str) -> Vec<String> {
-    fs::read_dir(dir_path)
+    let mut subdir_files: Vec<String> = Vec::new();
+    let mut file_paths = fs::read_dir(dir_path)
         .expect(format!("Directory not found: {}", dir_path).as_str())
         .into_iter()
         .flat_map(|entry_res| match entry_res {
@@ -345,13 +346,18 @@ fn get_jsonl_file_paths_from_dir(dir_path: &str) -> Vec<String> {
                         _ => None,
                     })
                 } else {
+                    let mut files_in_subdir = get_jsonl_file_paths_from_dir(path.to_str().unwrap()); //TODO: could fail if user passes a subdir or filename with non-Unicode chars
+                    subdir_files.append(&mut files_in_subdir);
                     None
                 }
             }
             _ => None,
         })
         .flatten()
-        .collect::<Vec<String>>()
+        .collect::<Vec<String>>();
+
+    file_paths.append(&mut subdir_files);
+    file_paths
 }
 
 fn read_jsonl_from_file(path: &str) -> JsonLFile {
@@ -380,7 +386,10 @@ async fn send_json_file_to_kafka<'a>(
     batch_size: &u16,
 ) {
     let cloned_contents = file.clone().contents;
-    let chunks: Vec<Vec<String>> = vec![cloned_contents];
+    let chunks: Vec<Vec<String>> = cloned_contents
+        .chunks(usize::from(batch_size.to_owned()))
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<Vec<String>>>();
 
     let producer_stream = stream! {
         for json_chunk in chunks {
@@ -439,14 +448,17 @@ async fn run() {
                 .map::<JsonLFile, _>(|path| read_jsonl_from_file(path.as_str()))
                 .collect::<Vec<JsonLFile>>();
 
-            let file_chunks: Vec<Vec<JsonLFile>> = vec![jsonl_loaded_files];
+            let file_chunks: Vec<Vec<JsonLFile>> = jsonl_loaded_files
+                .chunks(usize::from(configuration.number_of_threads.to_owned()))
+                .map(|chunk| chunk.to_vec())
+                .collect::<Vec<Vec<JsonLFile>>>();
 
             for chunk in file_chunks {
                 for file in chunk {
                     let cloned_client = partition_client.clone();
                     let cloned_batch_size = Arc::new(configuration.batch_size);
                     let cloned_file = Arc::new(file);
-                    println!("before spawning");
+
                     tokio::spawn(async move {
                         send_json_file_to_kafka(
                             cloned_client.as_ref(),
