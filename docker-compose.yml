@@ -11,6 +11,10 @@ services:
       - KAFKA_BATCH_INTERVAL=500
       - THREAD_NUMBER=1000
       - RUST_BACKTRACE=full
+      - DATA_SOURCE=jsonl
+    volumes:
+      - ./test-data/test.jsonl:/app/data/jsonl/test.jsonl
+      - ./test-data/test.jsonl:/app/data/jsonl/test/test.jsonl
   zookeeper:
     image: 'bitnami/zookeeper:3.7'
     environment:
@@ -21,6 +25,7 @@ services:
       - "29092:29092"
       - "9092:9092"
     environment:
+      - KAFKA_BROKER_ID=1
       - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
       - ALLOW_PLAINTEXT_LISTENER=yes
       - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CLIENT:PLAINTEXT,EXTERNAL:PLAINTEXT
